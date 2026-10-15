@@ -1,0 +1,45 @@
+{
+  "name": "eventtracker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Monochrome event discovery and management platform",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n api,client -c white,gray \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "node --watch server/index.js",
+    "dev:client": "npm run dev --workspace client -- --host 0.0.0.0",
+    "build": "npm run build --workspace client",
+    "build:dist": "node scripts/assemble-dist.js",
+    "start": "node scripts/assemble-dist.js && node server/index.js",
+    "seed": "node server/scripts/seed.js",
+    "reset-db": "node server/scripts/seed.js --reset",
+    "clean-events": "node server/scripts/clean-events.js",
+    "make-admin": "node server/scripts/make-admin.js",
+    "test:api": "node --test server/tests/api.test.js",
+    "test:ui": "npm run test --workspace client"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "compression": "^1.7.4",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.0.2",
+    "qrcode": "^1.5.4",
+    "socket.io": "^4.8.1",
+    "sql.js": "^1.13.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "overrides": {
+    "shell-quote": "^1.12.0"
+  }
+}
