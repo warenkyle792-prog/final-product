@@ -4,10 +4,10 @@
       "includeFiles": "{client/dist/**,data/**}"
     }
   },
-  "rewrites": [
+  "routes": [
     {
-      "source": "/(.*)",
-      "destination": "/api/index.js"
+      "src": "/(.*)",
+      "dest": "/api/index.js"
     }
   ]
 }
