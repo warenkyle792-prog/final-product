@@ -1,223 +1,631 @@
 const express = require('express');
-const { requireAuth, requireRole } = require('../lib/auth');
-const { nowIso, slugify, isId, isString, validCurrency, makeSlugUnique, notify, audit, pagination, fromMinor } = require('../lib/helpers');
-const { limiter } = require('../lib/rate-limits');
+const db = require('../db');
+const { requireAuth, optionalAuth } = require('../middleware/auth');
+const {
+  getEventById, listEvents, attendeePreview, getUserById, audit,
+  listTicketTypes, getTicketType, userStats,
+} = require('../db/helpers');
+const notifications = require('../services/notifications');
+const promotions = require('../services/promotions');
+const tickets = require('../services/tickets');
+const money = require('../services/payments/money');
 
-const EVENT_SELECT = `SELECT e.*,u.name AS organizer_name,u.username AS organizer_username,u.avatar AS organizer_avatar,
-  c.name AS category_name,c.slug AS category_slug,
-  (SELECT p.placement FROM promotions p WHERE p.event_id=e.id AND p.placement='sponsored' AND p.status='active' AND (p.ends_at IS NULL OR p.ends_at > ?) LIMIT 1) AS sponsored_placement,
-  (SELECT COUNT(*) FROM rsvps r WHERE r.event_id=e.id AND r.status='going') AS rsvp_count,
-  (SELECT COUNT(*) FROM tickets t WHERE t.event_id=e.id AND t.status IN ('valid','checked_in')) AS ticket_count
-  FROM events e JOIN users u ON u.id=e.organizer_id JOIN categories c ON c.id=e.category_id`;
-function dateValid(value) { return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`)); }
-const LOCAL_IMAGE_PATH = /^\/(uploads|covers)\/[a-z0-9-]+\.(jpg|jpeg|png|webp|gif)$/i;
-const LOCAL_VIDEO_PATH = /^\/uploads\/[a-z0-9-]+\.(mp4|webm|mov)$/i;
-function coverImageValid(value) { return typeof value === 'string' && value.length <= 400 && (value === '' || LOCAL_IMAGE_PATH.test(value)); }
-function videoUrlValid(value) { return typeof value === 'string' && value.length <= 400 && (value === '' || LOCAL_VIDEO_PATH.test(value)); }
-function cleanEventInput(body, partial = false) {
-  const result = {};
-  if (!partial || body.title !== undefined) result.title = String(body.title || '').trim();
-  if (!partial || body.description !== undefined) result.description = String(body.description || '').trim();
-  if (!partial || body.category_id !== undefined) result.category_id = Number(body.category_id);
-  if (!partial || body.date !== undefined) result.date = String(body.date || '').trim();
-  if (!partial || body.time !== undefined) result.time = String(body.time || '').trim();
-  if (!partial || body.end_time !== undefined) result.end_time = String(body.end_time || '').trim();
-  if (!partial || body.location !== undefined) result.location = String(body.location || '').trim();
-  if (!partial || body.venue !== undefined) result.venue = String(body.venue || '').trim();
-  if (!partial || body.price !== undefined || body.price_minor !== undefined) {
-    result.price_minor = body.price_minor !== undefined ? Number(body.price_minor) : Math.round(Number(body.price || 0) * 100);
+const router = express.Router();
+
+/* ------------------------------------------------------------------ *
+ * Helpers
+ * ------------------------------------------------------------------ */
+
+function viewerFlags(event, userId) {
+  if (!userId) return { is_saved: false, is_following: false, my_rsvp: null, has_ticket: false, is_host: false };
+
+  return {
+    is_saved: Boolean(db.prepare('SELECT 1 FROM saves WHERE event_id = ? AND user_id = ?').get(event.id, userId)),
+    is_following: Boolean(db.prepare('SELECT 1 FROM event_follows WHERE event_id = ? AND user_id = ?').get(event.id, userId)),
+    my_rsvp: db.prepare('SELECT status FROM rsvps WHERE event_id = ? AND user_id = ?').get(event.id, userId)?.status || null,
+    has_ticket: Boolean(db.prepare("SELECT 1 FROM tickets WHERE event_id = ? AND user_id = ? AND status IN ('valid','used')").get(event.id, userId)),
+    is_host: event.host_id === userId,
+  };
+}
+
+function tierPayload(eventId) {
+  return listTicketTypes(eventId, { activeOnly: true }).map((t) => ({
+    id: t.id,
+    name: t.name,
+    description: t.description,
+    price_cents: t.price_cents,
+    currency: t.currency,
+    price_formatted: money.format(t.price_cents, t.currency),
+    quantity: t.quantity,
+    sold: t.sold,
+    remaining: t.remaining,
+    per_user_limit: t.per_user_limit,
+    is_sold_out: t.is_sold_out,
+    sales_end_at: t.sales_end_at,
+  }));
+}
+
+/* ------------------------------------------------------------------ *
+ * Discovery
+ * ------------------------------------------------------------------ */
+
+/** GET /api/events — discovery with search / filters / sort / pagination */
+router.get('/', optionalAuth, (req, res) => {
+  const {
+    search = '', category = '', when = '', price = '', location = '', sort = 'soon',
+    page = '1', limit = '24', from = '', to = '', min_price: minPrice, max_price: maxPrice,
+    host = '', promoted = '',
+  } = req.query;
+
+  const lim = Math.min(parseInt(limit, 10) || 24, 60);
+  const pageNum = Math.max(parseInt(page, 10) || 1, 1);
+  const offset = (pageNum - 1) * lim;
+
+  const hostRecord = host ? db.prepare('SELECT id FROM users WHERE username = ?').get(String(host).toLowerCase()) : null;
+
+  const { events, total } = listEvents({
+    search: String(search).slice(0, 80),
+    category: String(category),
+    location: String(location).slice(0, 60),
+    when: String(when),
+    price: String(price),
+    minPrice: minPrice !== undefined && minPrice !== '' ? Number(minPrice) : null,
+    maxPrice: maxPrice !== undefined && maxPrice !== '' ? Number(maxPrice) : null,
+    from: String(from),
+    to: String(to),
+    sort: String(sort),
+    limit: lim,
+    offset,
+    hostId: hostRecord?.id || null,
+    promoted: String(promoted) === 'true',
+  });
+
+  res.json({
+    events: events.map((e) => ({ ...e, ...viewerFlags(e, req.userId) })),
+    total,
+    page: pageNum,
+    pageSize: lim,
+    pages: Math.max(1, Math.ceil(total / lim)),
+  });
+});
+
+/** GET /api/events/featured — featured + promoted rail. */
+router.get('/featured', optionalAuth, (req, res) => {
+  const promoted = listEvents({ promoted: true, limit: 6 }).events;
+  const featured = listEvents({ featured: true, limit: 8, sort: 'popular' }).events;
+  const popular = listEvents({ limit: 8, sort: 'popular' }).events;
+
+  const merged = [];
+  for (const list of [promoted, featured, popular]) {
+    for (const event of list) {
+      if (!merged.find((e) => e.id === event.id)) merged.push(event);
+    }
   }
-  if (!partial || body.currency !== undefined) result.currency = String(body.currency || 'KES').toUpperCase();
-  if (!partial || body.capacity !== undefined) result.capacity = Number(body.capacity || 100);
-  if (!partial || body.cover_image !== undefined) result.cover_image = String(body.cover_image || '').trim();
-  if (!partial || body.video_url !== undefined) result.video_url = String(body.video_url || '').trim();
-  if (!partial || body.status !== undefined) result.status = body.status === 'draft' ? 'draft' : 'published';
-  return result;
-}
-function validEvent(data, partial = false) {
-  const checks = [
-    ['title', isString(data.title, 3, 120)], ['description', isString(data.description, 12, 5000)],
-    ['category_id', isId(data.category_id)], ['date', dateValid(data.date)],
-    ['time', /^\d{2}:\d{2}$/.test(data.time || '')], ['location', isString(data.location, 2, 100)],
-    ['venue', (data.venue || '').length <= 120], ['price', Number.isSafeInteger(data.price_minor) && data.price_minor >= 0 && data.price_minor <= 100000000],
-    ['currency', validCurrency(data.currency)], ['capacity', Number.isInteger(data.capacity) && data.capacity > 0 && data.capacity <= 1000000],
-    ['cover_image', coverImageValid(data.cover_image)], ['video_url', videoUrlValid(data.video_url)]
-  ];
-  if (partial) return checks.filter(([key]) => Object.prototype.hasOwnProperty.call(data, key)).every(([, okay]) => okay);
-  return checks.every(([, okay]) => okay);
-}
-function createEventsRouter({ db, config, io }) {
-  const router = express.Router();
-  const sensitive = limiter(config, 'sensitive', 'SENSITIVE_RATE_LIMITED');
 
-  router.get('/categories', (_req, res) => res.json({ categories: db.all('SELECT id,name,slug,description,cover,color,sort_order FROM categories ORDER BY sort_order,name') }));
-  router.get('/categories/:slug', (req, res) => {
-    const category = db.get('SELECT * FROM categories WHERE slug = ?', [String(req.params.slug).slice(0, 90)]);
-    if (!category) return res.status(404).json({ error: 'NOT_FOUND' });
-    const events = db.all(`${EVENT_SELECT} WHERE e.status='published' AND c.id=? ORDER BY e.date,e.time LIMIT 100`, [nowIso(), category.id]);
-    res.json({ category, events });
+  res.json({
+    events: merged.slice(0, 8).map((e) => ({ ...e, ...viewerFlags(e, req.userId) })),
   });
-  router.get('/feed', (_req, res) => {
-    const today = new Date().toISOString().slice(0, 10);
-    const params = [nowIso(), today];
-    const upcoming = db.all(`${EVENT_SELECT} WHERE e.status='published' AND e.date >= ? ORDER BY CASE WHEN sponsored_placement='sponsored' THEN 0 ELSE 1 END, e.date,e.time LIMIT 12`, params);
-    const featured = db.all(`${EVENT_SELECT} WHERE e.status='published' AND e.date >= ? AND (e.featured=1 OR EXISTS(SELECT 1 FROM promotions p WHERE p.event_id=e.id AND p.status='active' AND p.placement IN ('featured','sponsored') AND (p.ends_at IS NULL OR p.ends_at > ?))) ORDER BY CASE WHEN sponsored_placement='sponsored' THEN 0 ELSE 1 END,e.date,e.time LIMIT 8`, [nowIso(), today, nowIso()]);
-    const categories = db.all('SELECT id,name,slug,description,cover,color FROM categories ORDER BY sort_order,name');
-    res.json({ featured, upcoming, categories });
-  });
-  router.get('/events', (req, res) => {
-    const { page, limit, offset } = pagination(req.query, 16, 60);
-    const where = ["e.status='published'"];
-    const params = [];
-    const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 100) : '';
-    if (q) { where.push('(e.title LIKE ? OR e.description LIKE ? OR e.location LIKE ? OR u.name LIKE ?)'); const term = `%${q}%`; params.push(term, term, term, term); }
-    const category = typeof req.query.category === 'string' ? req.query.category.slice(0, 90) : '';
-    if (category) { where.push('(c.slug=? OR CAST(c.id AS TEXT)=?)'); params.push(category, category); }
-    if (typeof req.query.dateFrom === 'string' && dateValid(req.query.dateFrom)) { where.push('e.date>=?'); params.push(req.query.dateFrom); }
-    if (typeof req.query.dateTo === 'string' && dateValid(req.query.dateTo)) { where.push('e.date<=?'); params.push(req.query.dateTo); }
-    if (typeof req.query.location === 'string' && req.query.location.trim()) { where.push('(e.location LIKE ? OR e.venue LIKE ?)'); const location = `%${req.query.location.trim().slice(0, 80)}%`; params.push(location, location); }
-    if (req.query.price === 'free') where.push('e.price_minor=0');
-    if (req.query.price === 'paid') where.push('e.price_minor>0');
-    if (req.query.maxPrice && Number.isFinite(Number(req.query.maxPrice)) && Number(req.query.maxPrice) >= 0) { where.push('e.price_minor<=?'); params.push(Math.round(Number(req.query.maxPrice) * 100)); }
-    const whereSql = where.join(' AND ');
-    const total = db.get(`SELECT COUNT(*) AS n FROM events e JOIN users u ON u.id=e.organizer_id JOIN categories c ON c.id=e.category_id WHERE ${whereSql}`, params).n;
-    const sort = req.query.sort === 'newest' ? 'e.created_at DESC' : req.query.sort === 'price' ? 'e.price_minor,e.date' : req.query.sort === 'date' ? 'e.date,e.time' : "CASE WHEN sponsored_placement='sponsored' THEN 0 ELSE 1 END, CASE WHEN EXISTS(SELECT 1 FROM promotions p WHERE p.event_id=e.id AND p.status='active' AND p.placement='boost' AND (p.ends_at IS NULL OR p.ends_at>?)) THEN 0 ELSE 1 END,e.featured DESC,e.date,e.time";
-    const countParams = [nowIso(), ...params];
-    const events = db.all(`${EVENT_SELECT} WHERE ${whereSql} ORDER BY ${sort} LIMIT ? OFFSET ?`, [...countParams, ...(sort.includes('?') ? [nowIso()] : []), limit, offset]);
-    res.json({ events: events.map((event) => ({ ...event, price_major: fromMinor(event.price_minor) })), page, limit, total, pages: Math.ceil(total / limit) });
-  });
+});
 
-  router.get('/events/:id/:slug?', (req, res) => {
-    if (!isId(req.params.id)) return res.status(400).json({ error: 'INVALID_INPUT' });
-    const event = db.get(`${EVENT_SELECT} WHERE e.id=?`, [nowIso(), Number(req.params.id)]);
-    if (!event || (event.status !== 'published' && req.auth?.user.id !== event.organizer_id && req.auth?.user.role !== 'admin')) return res.status(404).json({ error: 'NOT_FOUND' });
-    const ticketTypes = db.all('SELECT id,event_id,name,description,price_minor,currency,quantity,sold FROM ticket_types WHERE event_id=? ORDER BY price_minor,id', [event.id]);
-    const comments = db.all(`SELECT c.id,c.event_id,c.body,c.created_at,u.id AS user_id,u.name AS user_name,u.username,u.avatar FROM comments c JOIN users u ON u.id=c.user_id WHERE c.event_id=? ORDER BY c.created_at DESC LIMIT 40`, [event.id]);
-    const viewer = req.auth?.user.id;
-    event.viewer_following = viewer ? Boolean(db.get('SELECT 1 FROM event_follows WHERE user_id=? AND event_id=?', [viewer, event.id])) : false;
-    event.viewer_saved = viewer ? Boolean(db.get('SELECT 1 FROM saves WHERE user_id=? AND event_id=?', [viewer, event.id])) : false;
-    event.viewer_rsvp = viewer ? Boolean(db.get("SELECT 1 FROM rsvps WHERE user_id=? AND event_id=? AND status='going'", [viewer, event.id])) : false;
-    res.json({ event, ticketTypes, comments });
-  });
+/** GET /api/events/locations — cities with upcoming events (filter options). */
+router.get('/locations', (_req, res) => {
+  const { eventLocations } = require('../db/helpers');
+  res.json({ locations: eventLocations() });
+});
 
-  router.post('/events', requireAuth, (req, res, next) => {
-    try {
-      const input = cleanEventInput(req.body || {});
-      if (!validEvent(input) || !db.get('SELECT id FROM categories WHERE id=?', [input.category_id])) return res.status(400).json({ error: 'INVALID_EVENT' });
-      if (input.date < new Date().toISOString().slice(0, 10)) return res.status(400).json({ error: 'EVENT_DATE_IN_PAST' });
-      const tiers = Array.isArray(req.body.ticket_tiers) ? req.body.ticket_tiers.slice(0, 8) : [];
-      if (req.body.ticket_tiers && (!Array.isArray(req.body.ticket_tiers) || req.body.ticket_tiers.length > 8 || tiers.some((t) => !isString(t.name, 2, 60) || !Number.isFinite(Number(t.price)) || Number(t.price) < 0 || !Number.isInteger(Number(t.quantity)) || Number(t.quantity) < 1))) return res.status(400).json({ error: 'INVALID_TICKET_TIERS' });
-      const stamp = nowIso();
-      const slug = makeSlugUnique(db, input.title);
-      const result = db.run(`INSERT INTO events(organizer_id,category_id,title,slug,description,date,time,end_time,location,venue,price_minor,currency,capacity,cover_image,video_url,status,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [req.auth.user.id, input.category_id, input.title, slug, input.description, input.date, input.time, input.end_time, input.location, input.venue, input.price_minor, input.currency, input.capacity, input.cover_image, input.video_url, input.status, stamp, stamp]);
-      const eventId = result.lastID;
-      for (const tier of tiers) db.run('INSERT INTO ticket_types(event_id,name,description,price_minor,currency,quantity) VALUES(?,?,?,?,?,?)', [eventId, String(tier.name).trim(), String(tier.description || '').slice(0, 180), Math.round(Number(tier.price) * 100), input.currency, Number(tier.quantity)]);
-      const event = db.get('SELECT * FROM events WHERE id=?', [eventId]);
-      audit(db, req.auth.user.id, 'event.create', 'event', eventId, { title: input.title });
-      res.status(201).json({ event });
-    } catch (error) { next(error); }
-  });
+/** GET /api/events/:id — full detail */
+router.get('/:id(\\d+)', optionalAuth, (req, res) => {
+  const event = getEventById(req.params.id, { countView: true });
+  if (!event) return res.status(404).json({ error: 'Event not found' });
 
-  router.patch('/events/:id', requireAuth, (req, res) => {
-    if (!isId(req.params.id)) return res.status(400).json({ error: 'INVALID_INPUT' });
-    const current = db.get('SELECT * FROM events WHERE id=?', [Number(req.params.id)]);
-    if (!current) return res.status(404).json({ error: 'NOT_FOUND' });
-    if (current.organizer_id !== req.auth.user.id && req.auth.user.role !== 'admin') return res.status(403).json({ error: 'NOT_ALLOWED' });
-    const input = cleanEventInput(req.body || {}, true);
-    const merged = { ...current, ...input };
-    if (!validEvent(merged) || (input.category_id && !db.get('SELECT id FROM categories WHERE id=?', [input.category_id]))) return res.status(400).json({ error: 'INVALID_EVENT' });
-    const stamp = nowIso();
-    db.run(`UPDATE events SET category_id=?,title=?,description=?,date=?,time=?,end_time=?,location=?,venue=?,price_minor=?,currency=?,capacity=?,cover_image=?,video_url=?,status=?,updated_at=? WHERE id=?`, [merged.category_id, merged.title, merged.description, merged.date, merged.time, merged.end_time, merged.location, merged.venue, merged.price_minor, merged.currency, merged.capacity, merged.cover_image, merged.video_url, merged.status, stamp, current.id]);
-    res.json({ event: db.get('SELECT * FROM events WHERE id=?', [current.id]) });
-  });
+  event.attendees = attendeePreview(event.id, 8);
+  Object.assign(event, viewerFlags(event, req.userId));
 
-  router.delete('/events/:id', requireAuth, (req, res) => {
-    const event = db.get('SELECT * FROM events WHERE id=?', [Number(req.params.id)]);
-    if (!event) return res.status(404).json({ error: 'NOT_FOUND' });
-    if (event.organizer_id !== req.auth.user.id && req.auth.user.role !== 'admin') return res.status(403).json({ error: 'NOT_ALLOWED' });
-    db.run("UPDATE events SET status='cancelled',updated_at=? WHERE id=?", [nowIso(), event.id]);
-    audit(db, req.auth.user.id, 'event.cancel', 'event', event.id);
-    res.json({ ok: true });
+  event.host = getUserById(event.host_id);
+  if (event.host) event.host.stats = userStats(event.host_id);
+
+  event.ticket_types = tierPayload(event.id);
+  event.promotion = promotions.activeForEvent(event.id) || null;
+  event.check_in_stats = event.host_id === req.userId || req.user?.role === 'admin'
+    ? tickets.checkInStats(event.id)
+    : undefined;
+
+  res.json({ event });
+});
+
+/* ------------------------------------------------------------------ *
+ * Create / update / delete
+ * ------------------------------------------------------------------ */
+
+/** POST /api/events — create */
+router.post('/', requireAuth, (req, res) => {
+  const {
+    title, tagline = '', description, category_id: categoryId, venue = '', city = '', country = 'Kenya',
+    starts_at: startsAt, ends_at: endsAt = '', price = 0, currency = money.DEFAULT_CURRENCY,
+    capacity = 0, image_url: imageUrl = '', video_url: videoUrl = '', tags = '',
+    contact_email: contactEmail = '', contact_phone: contactPhone = '', ticket_types: ticketTypes = null,
+  } = req.body || {};
+
+  if (!title || !description || !categoryId || !startsAt) {
+    return res.status(400).json({ error: 'Title, description, category and start date are required' });
+  }
+
+  const currencyCode = String(currency).toUpperCase();
+  const priceCents = Math.max(0, Math.round(Number(price) * 100)) || 0;
+  const tagString = Array.isArray(tags) ? tags.join(',') : String(tags);
+
+  const eventId = db.transaction(() => {
+    const info = db.prepare(`
+      INSERT INTO events (title, tagline, description, category_id, host_id, venue, city, country,
+                          starts_at, ends_at, price_cents, currency, capacity, image_url, video_url,
+                          tags, contact_email, contact_phone, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'published')
+    `).run(
+      String(title).trim().slice(0, 140),
+      String(tagline).trim().slice(0, 200),
+      String(description).trim(),
+      Number(categoryId),
+      req.userId,
+      String(venue).trim().slice(0, 140),
+      String(city).trim().slice(0, 80),
+      String(country).trim().slice(0, 80),
+      String(startsAt).slice(0, 19).replace('T', ' '),
+      endsAt ? String(endsAt).slice(0, 19).replace('T', ' ') : '',
+      priceCents,
+      money.isSupported(currencyCode) ? currencyCode : money.DEFAULT_CURRENCY,
+      Math.max(0, parseInt(capacity, 10) || 0),
+      String(imageUrl).trim().slice(0, 500),
+      String(videoUrl).trim().slice(0, 500),
+      tagString.slice(0, 300),
+      String(contactEmail).trim().slice(0, 140),
+      String(contactPhone).trim().slice(0, 40)
+    );
+
+    const id = info.lastInsertRowid;
+
+    // Ticket tiers: the organiser's list, or a single tier derived from the
+    // simple price/capacity fields on the form.
+    const tiers = Array.isArray(ticketTypes) && ticketTypes.length
+      ? ticketTypes
+      : [{
+        name: priceCents > 0 ? 'General admission' : 'Free entry',
+        price_cents: priceCents,
+        quantity: Math.max(0, parseInt(capacity, 10) || 0),
+      }];
+
+    tiers.slice(0, 8).forEach((tier, index) => {
+      const tierPrice = Math.max(0, Math.round(Number(tier.price_cents ?? tier.price ?? 0)));
+      db.prepare(`
+        INSERT INTO ticket_types (event_id, name, description, price_cents, currency, quantity, per_user_limit, sort_order)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        id,
+        String(tier.name || `Ticket ${index + 1}`).trim().slice(0, 60),
+        String(tier.description || '').slice(0, 200),
+        tierPrice,
+        money.isSupported(currencyCode) ? currencyCode : money.DEFAULT_CURRENCY,
+        Math.max(0, parseInt(tier.quantity, 10) || 0),
+        Math.max(1, Math.min(parseInt(tier.per_user_limit, 10) || 10, 50)),
+        index
+      );
+    });
+
+    return id;
   });
 
-  router.post('/events/:id/follow', requireAuth, (req, res) => {
-    const event = db.get('SELECT id,organizer_id,title FROM events WHERE id=? AND status="published"', [Number(req.params.id)]);
-    if (!event) return res.status(404).json({ error: 'NOT_FOUND' });
-    const prior = db.get('SELECT 1 AS yes FROM event_follows WHERE user_id=? AND event_id=?', [req.auth.user.id, event.id]);
-    if (prior) db.run('DELETE FROM event_follows WHERE user_id=? AND event_id=?', [req.auth.user.id, event.id]);
-    else {
-      db.run('INSERT INTO event_follows(user_id,event_id,created_at) VALUES(?,?,?)', [req.auth.user.id, event.id, nowIso()]);
-      if (event.organizer_id !== req.auth.user.id) notify(db, io, event.organizer_id, 'follow', 'Someone is following your event', `${req.auth.user.name} is following ${event.title}.`, 'event', event.id);
+  const event = getEventById(eventId);
+
+  // Let the organiser's followers know straight away.
+  const followers = db.prepare('SELECT follower_id FROM follows WHERE following_id = ? LIMIT 500').all(req.userId);
+  if (followers.length) {
+    notifications.notifyMany(followers.map((f) => f.follower_id), {
+      type: 'event',
+      title: `${req.user.name} published a new event`,
+      body: event.title,
+      link: `/events/${event.id}`,
+      actorId: req.userId,
+      eventId: event.id,
+    });
+  }
+
+  audit(req.userId, 'event.created', 'event', event.id, event.title);
+
+  res.status(201).json({ event: { ...event, ...viewerFlags(event, req.userId), ticket_types: tierPayload(event.id) } });
+});
+
+/** PUT /api/events/:id — update (host or admin) */
+router.put('/:id(\\d+)', requireAuth, (req, res) => {
+  const event = getEventById(req.params.id);
+  if (!event) return res.status(404).json({ error: 'Event not found' });
+  if (event.host_id !== req.userId && req.user?.role !== 'admin') {
+    return res.status(403).json({ error: 'Only the organiser can edit this event' });
+  }
+
+  const b = req.body || {};
+  const toSql = (v) => (v ? String(v).slice(0, 19).replace('T', ' ') : '');
+
+  db.transaction(() => {
+    db.prepare(`
+      UPDATE events SET
+        title = COALESCE(?, title),
+        tagline = COALESCE(?, tagline),
+        description = COALESCE(?, description),
+        venue = COALESCE(?, venue),
+        city = COALESCE(?, city),
+        country = COALESCE(?, country),
+        category_id = COALESCE(?, category_id),
+        starts_at = COALESCE(?, starts_at),
+        ends_at = COALESCE(?, ends_at),
+        capacity = COALESCE(?, capacity),
+        image_url = COALESCE(?, image_url),
+        video_url = COALESCE(?, video_url),
+        tags = COALESCE(?, tags),
+        contact_email = COALESCE(?, contact_email),
+        contact_phone = COALESCE(?, contact_phone),
+        status = COALESCE(?, status)
+      WHERE id = ?
+    `).run(
+      b.title ?? null,
+      b.tagline ?? null,
+      b.description ?? null,
+      b.venue ?? null,
+      b.city ?? null,
+      b.country ?? null,
+      b.category_id ? Number(b.category_id) : null,
+      b.starts_at ? toSql(b.starts_at) : null,
+      b.ends_at !== undefined ? toSql(b.ends_at) : null,
+      b.capacity !== undefined ? Math.max(0, parseInt(b.capacity, 10) || 0) : null,
+      b.image_url ?? null,
+      b.video_url ?? null,
+      Array.isArray(b.tags) ? b.tags.join(',') : b.tags ?? null,
+      b.contact_email ?? null,
+      b.contact_phone ?? null,
+      ['published', 'draft', 'cancelled'].includes(b.status) ? b.status : null,
+      event.id
+    );
+
+    // Replace tiers when the organiser supplies a new list (never below what
+    // has already been sold).
+    if (Array.isArray(b.ticket_types)) {
+      const sold = db.prepare('SELECT COUNT(*) AS n FROM tickets WHERE event_id = ? AND status IN (\'valid\',\'used\')').get(event.id).n;
+      const newTotal = b.ticket_types.reduce((sum, t) => sum + (parseInt(t.quantity, 10) || 0), 0);
+      if (b.ticket_types.length && newTotal < sold) {
+        throw Object.assign(new Error(`You have already issued ${sold} tickets — the new capacity cannot be lower`), { status: 400 });
+      }
+      db.prepare('DELETE FROM ticket_types WHERE event_id = ? AND sold = 0').run(event.id);
+      b.ticket_types.slice(0, 8).forEach((tier, index) => {
+        db.prepare(`
+          INSERT INTO ticket_types (event_id, name, description, price_cents, currency, quantity, per_user_limit, sort_order)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          event.id,
+          String(tier.name || `Ticket ${index + 1}`).trim().slice(0, 60),
+          String(tier.description || '').slice(0, 200),
+          Math.max(0, Math.round(Number(tier.price_cents ?? tier.price ?? 0))),
+          event.currency,
+          Math.max(0, parseInt(tier.quantity, 10) || 0),
+          Math.max(1, Math.min(parseInt(tier.per_user_limit, 10) || 10, 50)),
+          index
+        );
+      });
     }
-    res.json({ following: !prior });
   });
-  router.post('/events/:id/save', requireAuth, (req, res) => {
-    const event = db.get('SELECT id FROM events WHERE id=? AND status="published"', [Number(req.params.id)]);
-    if (!event) return res.status(404).json({ error: 'NOT_FOUND' });
-    const prior = db.get('SELECT 1 AS yes FROM saves WHERE user_id=? AND event_id=?', [req.auth.user.id, event.id]);
-    if (prior) db.run('DELETE FROM saves WHERE user_id=? AND event_id=?', [req.auth.user.id, event.id]);
-    else db.run('INSERT INTO saves(user_id,event_id,created_at) VALUES(?,?,?)', [req.auth.user.id, event.id, nowIso()]);
-    res.json({ saved: !prior });
-  });
-  router.post('/events/:id/rsvp', requireAuth, (req, res) => {
-    const event = db.get('SELECT * FROM events WHERE id=? AND status="published"', [Number(req.params.id)]);
-    if (!event) return res.status(404).json({ error: 'NOT_FOUND' });
-    if (event.price_minor > 0) return res.status(409).json({ error: 'PAYMENT_REQUIRED' });
-    const existing = db.get('SELECT * FROM rsvps WHERE user_id=? AND event_id=?', [req.auth.user.id, event.id]);
-    const stamp = nowIso();
-    if (existing?.status === 'going') {
-      db.run("UPDATE rsvps SET status='cancelled' WHERE user_id=? AND event_id=?", [req.auth.user.id, event.id]);
-      return res.json({ registered: false });
+
+  const updated = getEventById(event.id);
+  if (b.status === 'cancelled' && event.status !== 'cancelled') {
+    const holders = db.prepare("SELECT DISTINCT user_id FROM tickets WHERE event_id = ? AND status IN ('valid','used')").all(event.id);
+    notifications.notifyMany(holders.map((h) => h.user_id), {
+      type: 'event',
+      title: 'Event cancelled',
+      body: `${updated.title} has been cancelled.`,
+      link: `/events/${updated.id}`,
+      eventId: updated.id,
+    });
+  }
+
+  res.json({ event: { ...updated, ...viewerFlags(updated, req.userId), ticket_types: tierPayload(updated.id) } });
+});
+
+/** DELETE /api/events/:id */
+router.delete('/:id(\\d+)', requireAuth, (req, res) => {
+  const event = getEventById(req.params.id);
+  if (!event) return res.status(404).json({ error: 'Event not found' });
+  if (event.host_id !== req.userId && req.user?.role !== 'admin') {
+    return res.status(403).json({ error: 'Only the organiser can delete this event' });
+  }
+
+  const sold = db.prepare("SELECT COUNT(*) AS n FROM tickets WHERE event_id = ? AND status IN ('valid','used')").get(event.id).n;
+  if (sold > 0) {
+    return res.status(400).json({
+      error: `This event has ${sold} issued ticket${sold === 1 ? '' : 's'}. Cancel it instead of deleting so attendees keep their records.`,
+    });
+  }
+
+  db.prepare('DELETE FROM events WHERE id = ?').run(event.id);
+  audit(req.userId, 'event.deleted', 'event', event.id, event.title);
+  res.json({ ok: true });
+});
+
+/* ------------------------------------------------------------------ *
+ * Follow / save / RSVP
+ * ------------------------------------------------------------------ */
+
+/** POST /api/events/:id/follow — follow or unfollow an event. */
+router.post('/:id(\\d+)/follow', requireAuth, (req, res) => {
+  const event = getEventById(req.params.id);
+  if (!event) return res.status(404).json({ error: 'Event not found' });
+
+  const existing = db.prepare('SELECT 1 FROM event_follows WHERE event_id = ? AND user_id = ?').get(event.id, req.userId);
+
+  if (existing) {
+    db.prepare('DELETE FROM event_follows WHERE event_id = ? AND user_id = ?').run(event.id, req.userId);
+  } else {
+    db.prepare('INSERT INTO event_follows (event_id, user_id) VALUES (?, ?)').run(event.id, req.userId);
+    notifications.create({
+      userId: event.host_id,
+      type: 'follow',
+      title: `${req.user.name} is following your event`,
+      body: event.title,
+      link: `/events/${event.id}`,
+      actorId: req.userId,
+      eventId: event.id,
+    });
+  }
+
+  const { n } = db.prepare('SELECT COUNT(*) AS n FROM event_follows WHERE event_id = ?').get(event.id);
+  res.json({ ok: true, is_following: !existing, follower_count: n });
+});
+
+/** POST /api/events/:id/save — toggle bookmark */
+router.post('/:id(\\d+)/save', requireAuth, (req, res) => {
+  const event = getEventById(req.params.id);
+  if (!event) return res.status(404).json({ error: 'Event not found' });
+
+  const existing = db.prepare('SELECT 1 FROM saves WHERE event_id = ? AND user_id = ?').get(event.id, req.userId);
+
+  if (existing) {
+    db.prepare('DELETE FROM saves WHERE event_id = ? AND user_id = ?').run(event.id, req.userId);
+  } else {
+    db.prepare('INSERT INTO saves (event_id, user_id) VALUES (?, ?)').run(event.id, req.userId);
+  }
+
+  res.json({ ok: true, is_saved: !existing });
+});
+
+/** POST /api/events/:id/rsvp { status: going|interested|none } */
+router.post('/:id(\\d+)/rsvp', requireAuth, (req, res) => {
+  const event = getEventById(req.params.id);
+  if (!event) return res.status(404).json({ error: 'Event not found' });
+
+  const status = String(req.body?.status || 'going');
+  if (!['going', 'interested', 'none'].includes(status)) {
+    return res.status(400).json({ error: 'Status must be going, interested or none' });
+  }
+
+  if (status === 'none') {
+    db.prepare('DELETE FROM rsvps WHERE event_id = ? AND user_id = ?').run(event.id, req.userId);
+  } else {
+    db.prepare(`
+      INSERT INTO rsvps (event_id, user_id, status) VALUES (?, ?, ?)
+      ON CONFLICT(event_id, user_id) DO UPDATE SET status = excluded.status
+    `).run(event.id, req.userId, status);
+
+    if (status === 'going' && event.host_id !== req.userId) {
+      notifications.create({
+        userId: event.host_id,
+        type: 'rsvp',
+        title: `${req.user.name} is going to ${event.title}`,
+        link: `/events/${event.id}`,
+        actorId: req.userId,
+        eventId: event.id,
+      });
     }
-    if (existing) db.run("UPDATE rsvps SET status='going',created_at=? WHERE user_id=? AND event_id=?", [stamp, req.auth.user.id, event.id]);
-    else db.run("INSERT INTO rsvps(user_id,event_id,status,created_at) VALUES(?,?,'going',?)", [req.auth.user.id, event.id, stamp]);
-    if (event.organizer_id !== req.auth.user.id) notify(db, io, event.organizer_id, 'rsvp', 'New registration', `${req.auth.user.name} registered for ${event.title}.`, 'event', event.id);
-    res.status(201).json({ registered: true });
-  });
+  }
 
-  router.get('/comments', (req, res) => {
-    const eventId = Number(req.query.event_id);
-    if (!isId(eventId)) return res.status(400).json({ error: 'INVALID_INPUT' });
-    const comments = db.all('SELECT c.*,u.name AS user_name,u.username,u.avatar FROM comments c JOIN users u ON u.id=c.user_id WHERE c.event_id=? ORDER BY c.created_at DESC LIMIT 60', [eventId]);
-    res.json({ comments });
-  });
-  router.post('/comments', requireAuth, (req, res) => {
-    const eventId = Number(req.body?.event_id);
-    const body = typeof req.body?.body === 'string' ? req.body.body.trim() : '';
-    const event = db.get('SELECT id,organizer_id,title FROM events WHERE id=? AND status="published"', [eventId]);
-    if (!isId(eventId) || !event || !isString(body, 2, 1200)) return res.status(400).json({ error: 'INVALID_COMMENT' });
-    const result = db.run('INSERT INTO comments(event_id,user_id,body,created_at) VALUES(?,?,?,?)', [eventId, req.auth.user.id, body, nowIso()]);
-    const comment = db.get('SELECT c.*,u.name AS user_name,u.username,u.avatar FROM comments c JOIN users u ON u.id=c.user_id WHERE c.id=?', [result.lastID]);
-    if (event.organizer_id !== req.auth.user.id) notify(db, io, event.organizer_id, 'comment', 'New event comment', `${req.auth.user.name} commented on ${event.title}.`, 'event', eventId);
-    res.status(201).json({ comment });
-  });
+  const counts = db.prepare(`
+    SELECT
+      SUM(CASE WHEN status = 'going' THEN 1 ELSE 0 END) AS going,
+      SUM(CASE WHEN status = 'interested' THEN 1 ELSE 0 END) AS interested
+    FROM rsvps WHERE event_id = ?
+  `).get(event.id);
 
-  router.get('/admin/categories', requireRole('admin'), (_req, res) => res.json({ categories: db.all('SELECT * FROM categories ORDER BY sort_order,name') }));
-  router.post('/admin/categories', requireRole('admin'), sensitive, (req, res) => {
-    const name = String(req.body?.name || '').trim();
-    const description = String(req.body?.description || '').trim().slice(0, 280);
-    if (!isString(name, 2, 40) || db.get('SELECT id FROM categories WHERE name=?', [name])) return res.status(400).json({ error: 'INVALID_CATEGORY' });
-    const result = db.run('INSERT INTO categories(name,slug,description,color,sort_order) VALUES(?,?,?,?,?)', [name, slugify(name), description, '#222222', Number(req.body.sort_order) || 99]);
-    res.status(201).json({ category: db.get('SELECT * FROM categories WHERE id=?', [result.lastID]) });
-  });
-  router.patch('/admin/categories/:id', requireRole('admin'), sensitive, (req, res) => {
-    const id = Number(req.params.id);
-    const old = db.get('SELECT * FROM categories WHERE id=?', [id]);
-    if (!old) return res.status(404).json({ error: 'NOT_FOUND' });
-    const name = req.body?.name === undefined ? old.name : String(req.body.name).trim();
-    const description = req.body?.description === undefined ? old.description : String(req.body.description).trim().slice(0, 280);
-    if (!isString(name, 2, 40)) return res.status(400).json({ error: 'INVALID_CATEGORY' });
-    db.run('UPDATE categories SET name=?,slug=?,description=?,sort_order=? WHERE id=?', [name, slugify(name), description, Number.isInteger(Number(req.body.sort_order)) ? Number(req.body.sort_order) : old.sort_order, id]);
-    res.json({ category: db.get('SELECT * FROM categories WHERE id=?', [id]) });
-  });
-  router.delete('/admin/categories/:id', requireRole('admin'), sensitive, (req, res) => {
-    const id = Number(req.params.id);
-    if (db.get('SELECT id FROM events WHERE category_id=?', [id])) return res.status(409).json({ error: 'CATEGORY_HAS_EVENTS' });
-    db.run('DELETE FROM categories WHERE id=?', [id]);
-    res.json({ ok: true });
-  });
+  res.json({ ok: true, status, going_count: counts.going || 0, interested_count: counts.interested || 0 });
+});
 
-  return router;
-}
-module.exports = { createEventsRouter, EVENT_SELECT, cleanEventInput, validEvent };
+/** POST /api/events/:id/register — free registration (issues a ticket). */
+router.post('/:id(\\d+)/register', requireAuth, async (req, res, next) => {
+  try {
+    const event = getEventById(req.params.id);
+    if (!event) return res.status(404).json({ error: 'Event not found' });
+    if (event.status === 'cancelled') return res.status(400).json({ error: 'This event has been cancelled' });
+    if (event.is_past) return res.status(400).json({ error: 'This event has already taken place' });
+
+    const existing = db.prepare("SELECT code FROM tickets WHERE event_id = ? AND user_id = ? AND status IN ('valid','used')")
+      .get(event.id, req.userId);
+    if (existing) {
+      return res.json({ already_registered: true, ticket: await tickets.present(tickets.getByCode(existing.code)) });
+    }
+
+    const tiers = listTicketTypes(event.id, { activeOnly: true });
+    const freeTier = tiers.find((t) => t.price_cents === 0 && !t.is_sold_out);
+    if (tiers.length && !freeTier) {
+      return res.status(402).json({ error: 'This event has no free tickets — please buy a ticket to attend' });
+    }
+
+    const payments = require('../services/payments');
+    const result = payments.completeFreeRegistration({
+      userId: req.userId,
+      eventId: event.id,
+      items: freeTier ? [{ ticket_type_id: freeTier.id, quantity: 1 }] : [],
+      attendees: [{ name: req.user.name, email: req.user.email }],
+    });
+
+    db.prepare(`
+      INSERT INTO rsvps (event_id, user_id, status) VALUES (?, ?, 'going')
+      ON CONFLICT(event_id, user_id) DO UPDATE SET status = 'going'
+    `).run(event.id, req.userId);
+
+    const issued = db.prepare('SELECT id FROM tickets WHERE transaction_id = ?').all(result.transaction.id);
+    const ticket = issued.length ? tickets.getById(issued[0].id) : null;
+
+    res.status(201).json({
+      free: true,
+      transaction: result.transaction,
+      ticket: ticket ? await tickets.present(ticket) : null,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * Ticket tiers (organiser)
+ * ------------------------------------------------------------------ */
+
+/** PUT /api/events/:id/tickets — manage tiers after publishing. */
+router.put('/:id(\\d+)/tickets', requireAuth, (req, res, next) => {
+  try {
+    const event = getEventById(req.params.id);
+    if (!event) return res.status(404).json({ error: 'Event not found' });
+    if (event.host_id !== req.userId && req.user?.role !== 'admin') {
+      return res.status(403).json({ error: 'Only the organiser can manage tickets' });
+    }
+
+    const tiers = Array.isArray(req.body?.ticket_types) ? req.body.ticket_types : [];
+    if (!tiers.length) return res.status(400).json({ error: 'Provide at least one ticket type' });
+
+    db.transaction(() => {
+      for (const tier of tiers) {
+        const existing = tier.id ? getTicketType(tier.id) : null;
+        if (existing && existing.event_id === event.id) {
+          db.prepare(`
+            UPDATE ticket_types
+            SET name = ?, description = ?, price_cents = ?, quantity = ?, per_user_limit = ?, is_active = ?
+            WHERE id = ?
+          `).run(
+            String(tier.name || existing.name).slice(0, 60),
+            String(tier.description ?? existing.description).slice(0, 200),
+            Math.max(0, Math.round(Number(tier.price_cents ?? existing.price_cents))),
+            Math.max(existing.sold, parseInt(tier.quantity, 10) || 0),
+            Math.max(1, Math.min(parseInt(tier.per_user_limit, 10) || existing.per_user_limit, 50)),
+            tier.is_active === false ? 0 : 1,
+            existing.id
+          );
+        } else {
+          db.prepare(`
+            INSERT INTO ticket_types (event_id, name, description, price_cents, currency, quantity, per_user_limit, sort_order)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            event.id,
+            String(tier.name || 'New ticket').slice(0, 60),
+            String(tier.description || '').slice(0, 200),
+            Math.max(0, Math.round(Number(tier.price_cents) || 0)),
+            event.currency,
+            Math.max(0, parseInt(tier.quantity, 10) || 0),
+            Math.max(1, Math.min(parseInt(tier.per_user_limit, 10) || 10, 50)),
+            Number(tier.sort_order) || 0
+          );
+        }
+      }
+    });
+
+    res.json({ ticket_types: tierPayload(event.id), event: getEventById(event.id) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/** GET /api/events/:id/attendees — organiser guest list summary. */
+router.get('/:id(\\d+)/attendees', requireAuth, (req, res) => {
+  const event = getEventById(req.params.id);
+  if (!event) return res.status(404).json({ error: 'Event not found' });
+  if (event.host_id !== req.userId && req.user?.role !== 'admin') {
+    return res.status(403).json({ error: 'Only the organiser can view attendees' });
+  }
+
+  res.json({
+    attendees: tickets.listForEvent(event.id),
+    stats: tickets.checkInStats(event.id),
+    tiers: tickets.tiersSoldSummary(event.id),
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Comments
+ * ------------------------------------------------------------------ */
+
+router.get('/:id(\\d+)/comments', (req, res) => {
+  const rows = db.prepare(`
+    SELECT cm.*, u.name, u.username, u.avatar_url, u.role
+    FROM comments cm JOIN users u ON u.id = cm.user_id
+    WHERE cm.event_id = ? ORDER BY cm.created_at DESC LIMIT 100
+  `).all(req.params.id);
+  res.json({ comments: rows });
+});
+
+router.post('/:id(\\d+)/comments', requireAuth, (req, res) => {
+  const event = getEventById(req.params.id);
+  if (!event) return res.status(404).json({ error: 'Event not found' });
+
+  const body = String(req.body?.body || '').trim();
+  if (!body) return res.status(400).json({ error: 'Comment cannot be empty' });
+
+  const info = db.prepare('INSERT INTO comments (event_id, user_id, body) VALUES (?, ?, ?)')
+    .run(event.id, req.userId, body.slice(0, 1000));
+
+  const comment = db.prepare(`
+    SELECT cm.*, u.name, u.username, u.avatar_url, u.role
+    FROM comments cm JOIN users u ON u.id = cm.user_id WHERE cm.id = ?
+  `).get(info.lastInsertRowid);
+
+  if (event.host_id !== req.userId) {
+    notifications.create({
+      userId: event.host_id,
+      type: 'comment',
+      title: `${req.user.name} commented on ${event.title}`,
+      body: body.slice(0, 140),
+      link: `/events/${event.id}`,
+      actorId: req.userId,
+      eventId: event.id,
+    });
+  }
+
+  const io = req.app.get('io');
+  if (io) io.to(`event:${event.id}`).emit('event:comment', { eventId: event.id, comment });
+
+  res.status(201).json({ comment });
+});
+
+router.delete('/:id(\\d+)/comments/:commentId(\\d+)', requireAuth, (req, res) => {
+  const comment = db.prepare('SELECT * FROM comments WHERE id = ? AND event_id = ?')
+    .get(req.params.commentId, req.params.id);
+  if (!comment) return res.status(404).json({ error: 'Comment not found' });
+  if (comment.user_id !== req.userId && req.user?.role !== 'admin') {
+    return res.status(403).json({ error: 'You can only delete your own comments' });
+  }
+  db.prepare('DELETE FROM comments WHERE id = ?').run(comment.id);
+  res.json({ ok: true });
+});
+
+/* ------------------------------------------------------------------ *
+ * Related
+ * ------------------------------------------------------------------ */
+
+router.get('/:id(\\d+)/related', (req, res) => {
+  const event = getEventById(req.params.id);
+  if (!event) return res.status(404).json({ error: 'Event not found' });
+
+  const { events } = listEvents({ category: event.category_slug, limit: 6 });
+  const related = events.filter((e) => e.id !== event.id).slice(0, 4);
+
+  if (related.length < 4) {
+    const more = listEvents({ limit: 12 }).events.filter(
+      (e) => e.id !== event.id && !related.find((r) => r.id === e.id)
+    );
+    related.push(...more.slice(0, 4 - related.length));
+  }
+
+  res.json({ events: related });
+});
+
+module.exports = router;

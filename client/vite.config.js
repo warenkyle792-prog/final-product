@@ -1,25 +1,30 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
+/**
+ * Vite dev server.
+ *
+ * The backend (Express + Socket.IO) is proxied so the browser only ever talks
+ * to one origin — that keeps relative `/api` URLs working everywhere,
+ * including the sandbox preview URL.
+ */
 export default defineConfig({
   plugins: [react()],
   server: {
     host: '0.0.0.0',
-    allowedHosts: ['.e2b.app'],
     port: 5173,
     strictPort: true,
+    // The preview runs behind a proxy host, so accept any host header.
+    allowedHosts: true,
     proxy: {
       '/api': { target: 'http://127.0.0.1:5000', changeOrigin: true },
+      '/uploads': { target: 'http://127.0.0.1:5000', changeOrigin: true },
       '/socket.io': { target: 'http://127.0.0.1:5000', ws: true, changeOrigin: true },
-      '/uploads': { target: 'http://127.0.0.1:5000', changeOrigin: true }
-    }
+    },
   },
-  test: {
-    environment: 'jsdom',
-    globals: true,
-    setupFiles: ['./src/test/setup.js'],
-    restoreMocks: true,
-    testTimeout: 30000,
-    hookTimeout: 30000
-  }
+  build: {
+    outDir: 'dist',
+    sourcemap: false,
+    chunkSizeWarningLimit: 900,
+  },
 });

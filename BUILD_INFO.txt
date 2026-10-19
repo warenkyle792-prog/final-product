@@ -1,71 +1,30 @@
-VELCOR EventTracker — build v11 (2026-10-08)
-============================================
-If you can read this file, you have the CURRENT build.
-This zip contains the FULL app: backend (server/), frontend (client/),
-scripts, docs, and a pre-loaded database (data/eventtracker.sqlite).
+EventTracker — imported source
+==============================
+This checkout now runs the full application source imported from
+github.com/warenkyle792-prog/eventtracker:
 
-PRE-LOADED DATABASE:
-- Admin account: Velcorofficial@gmail.com  (password: the one you set — Kerubo#001)
-- All 8 event categories with cover images, site settings
-- No demo users, no demo events
+  server/   Express + Socket.IO API, SQLite (sql.js) data layer, seed script
+  client/   React (Vite) application — every page and component is editable
 
-BACKEND (server/) IN THIS BUILD:
-- Auth (sessions/JWT, bcrypt, lockout), rate limits, CORS/CSP/CSRF, uploads
-- Events, categories, profiles/follows, notifications, admin, payments (parked)
-- Chat: realtime Socket.IO, people search, message-request flow
-  (pending -> accept/decline; enforced on REST + Socket.IO; migration id 4)
-- Security hardening per SECURITY_AUDIT.md; npm audit: 0 vulnerabilities
-
-FRONTEND IN THIS BUILD:
-- `npm start` auto-assembles client/dist (startup fix)
-- Chat UI restyle: rounded card conversation list w/ avatars + unread pills,
-  search bar, round + button, Today divider, pill composer w/ round send;
-  backgrounds stay theme-matched (dark charcoal / light clear)
-- The app's own bottom nav (Home / Categories / Chat / Create Event / Menu)
-  now stays visible on the chat page too (sits above the chat panels);
-  no Settings entry — same nav, same size everywhere
-- FIXED: /chat route crash — the compiled bundle referenced an icon by an
-  unminified name (ArrowRight), throwing on render and blanking the whole
-  chat page (nav included). Bundle patched; verified in a real browser.
-
-UPGRADING FROM AN OLDER EXTRACT (admin missing?):
-  If your old data/ folder predates this database, your account may still be
-  a plain attendee there. Stop the server, then run:
-    npm run make-admin -- Velcorofficial@gmail.com
-  and start again — the Admin item appears in the account menu.
-- Bubbles: dark = grey incoming + green outgoing; light = clear
-- Payments UI hidden until launch (hide-payments.js)
-- VELCOR branding, login backdrop, 8 category covers
-
-RUN:
+RUN
   npm ci
-  npm start        ->  http://localhost:5000
-Sign in with Velcorofficial@gmail.com — admin panel at /admin.
+  npm run seed     # writes server/data + demo artwork (skips if data exists)
+  npm run build    # builds client/dist
+  npm start        # API + built client on http://localhost:5000
 
-- Profile pages: the old dark banner is replaced by a theme-matched band
-  showing Followers and Following (counts + clickable face chips); new public
-  API: GET /api/users/:id/followers and /api/users/:id/following.
+  npm run dev      # API :5000 and Vite :5173 with hot reload
 
-- Create-event page: "Upload your photo (gallery)" button at the top of the
-  form (opens your device gallery, sets the cover), quick date buttons
-  (Today / Tomorrow / Saturday / Next week), and plain-language publish
-  errors — including the past-date rejection that previously could look like
-  a silently missing event. Description ("About this event") and date/time
-  fields are in section 01.
-- WHY A PUBLISHED EVENT MAY HAVE BEEN MISSING: events with a past date are
-  rejected by the server (and by the form). With this build you get a clear
-  message instead of silence, and published events always appear on /events.
+DEMO ACCOUNTS (password123)
+  admin@eventtracker.app (admin) · daniel@ · zawadi@ · kamau@ · fatuma@
+  njeri@ · brian@ · wanjiku@ · omar@ · lucia@  (all @eventtracker.app)
 
-ACCOUNT VERIFICATION (BLUE TICK):
-- Admin panel -> Users tab: every account has a Verified/Unverified pill and
-  a Verify / Revoke button; each decision is audit-logged.
-- Verified accounts show a blue "Verified" tick badge next to their name on
-  their profile page.
-- Your admin account ships pre-verified.
+TESTS (server must be running)
+  npm run test:api     # API checks
+  npm run test:ui      # renders the React tree in jsdom and drives it
 
-SELF-CHECK AFTER EXTRACTING:
-  1. BUILD_INFO.txt says build v11
-  2. data/eventtracker.sqlite exists
-  3. package.json "start" contains "node scripts/assemble-dist.js"
-  4. server/routes/chat.js contains "chat/requests"
-  5. client/public/chat-launcher.js contains "chat-bottomnav"
+NOTES
+- The previous build (v11) shipped only a compiled client and a newer,
+  incompatible API. It remains available in git history on master and in the
+  commit preceding this import.
+- Runtime data lives in server/data (database) and server/uploads (media);
+  both are ignored by git and meant to be recreated with npm run seed.

@@ -1,0 +1,268 @@
+/* =============================================================
+   Type — self-hosted (client/public/fonts, latin subsets).
+   Shipping the files removes a render-blocking third-party request: if the
+   CDN is unreachable the page paints immediately instead of waiting.
+   ============================================================= */
+
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/inter-400.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('/fonts/inter-500.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 600 700;
+  font-display: swap;
+  src: url('/fonts/inter-600.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Plus Jakarta Sans';
+  font-style: normal;
+  font-weight: 500 600;
+  font-display: swap;
+  src: url('/fonts/plus-jakarta-sans-600.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Plus Jakarta Sans';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/fonts/plus-jakarta-sans-700.woff2') format('woff2');
+}
+
+/* =============================================================
+   EventTracker — design tokens
+   Two real themes:
+     light  → clean white / light grey surfaces, near-black text
+     dark   → true neutral black base, lighter glass surfaces
+
+   Palette rule: monochrome. Every value is a hue-free grey (equal RGB
+   channels), so hierarchy comes from contrast, weight and depth instead of
+   colour. Red is kept for exactly one job: destructive actions and failures.
+   ============================================================= */
+
+:root {
+  /* Type */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-display: 'Plus Jakarta Sans', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+  --fs-xs: 0.75rem;
+  --fs-sm: 0.8125rem;
+  --fs-base: 0.9375rem;
+  --fs-md: 1rem;
+  --fs-lg: 1.125rem;
+  --fs-xl: 1.375rem;
+  --fs-2xl: 1.75rem;
+  --fs-3xl: 2.25rem;
+  --fs-4xl: 3rem;
+
+  /* Radii — deliberately restrained, not pill-shaped */
+  --r-xs: 6px;
+  --r-sm: 8px;
+  --r-md: 11px;
+  --r-lg: 15px;
+  --r-xl: 20px;
+  --r-pill: 999px;
+
+  /* Spacing scale (8px base) */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-7: 32px;
+  --s-8: 40px;
+  --s-9: 56px;
+  --s-10: 72px;
+  --s-11: 96px;
+
+  /* Motion */
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --t-fast: 130ms var(--ease);
+  --t-med: 220ms var(--ease);
+  --t-slow: 380ms var(--ease);
+
+  /* Layout */
+  --nav-h: 64px;
+  --bottom-nav-h: 60px;
+  --max-w: 1200px;
+  --max-w-wide: 1360px;
+
+  /* Ink — graphite. A primary action is near-black on light and near-white
+     on dark, so "primary" reads from contrast rather than from a hue. */
+  --brand: #1c1c20;
+  --brand-hover: #000000;
+  --brand-soft: rgba(0, 0, 0, 0.06);
+  --brand-ring: rgba(0, 0, 0, 0.24);
+  --brand-ink: #ffffff;
+
+  /* Status is monochrome as well: settled states are solid ink chips, pending
+     states are outlined, and weight plus the label carries the meaning. */
+  --ok: #2a2a2f;
+  --ok-soft: rgba(0, 0, 0, 0.07);
+  --warn: #55555c;
+  --warn-soft: rgba(0, 0, 0, 0.05);
+  --danger: #b3261e;
+  --danger-soft: rgba(179, 38, 30, 0.10);
+  --info: #5a5a62;
+  --info-soft: rgba(0, 0, 0, 0.05);
+
+  --focus-ring: 0 0 0 3px var(--brand-ring);
+}
+
+/* =============================================================
+   LIGHT
+   ============================================================= */
+
+html[data-theme='light'] {
+  color-scheme: light;
+
+  --bg-0: #f7f7f7;
+  --bg-1: #efefef;
+  --bg-elevated: #ffffff;
+
+  --surface: #ffffff;
+  --surface-2: #fbfbfb;
+  --surface-3: #f1f1f1;
+
+  --glass: rgba(255, 255, 255, 0.78);
+  --glass-strong: rgba(255, 255, 255, 0.92);
+  --glass-border: rgba(0, 0, 0, 0.07);
+
+  --border: rgba(0, 0, 0, 0.10);
+  --border-strong: rgba(0, 0, 0, 0.18);
+  --border-subtle: rgba(0, 0, 0, 0.06);
+
+  --text-0: #141414;   /* headings */
+  --text-1: #3d3d3d;   /* body */
+  --text-2: #6b6b6b;   /* muted */
+  --text-3: #767676;   /* faint */
+  --text-inv: #ffffff;
+
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05), 0 4px 12px -6px rgba(0, 0, 0, 0.10);
+  --shadow-md: 0 2px 4px rgba(0, 0, 0, 0.04), 0 12px 28px -14px rgba(0, 0, 0, 0.18);
+  --shadow-lg: 0 4px 8px rgba(0, 0, 0, 0.04), 0 24px 56px -22px rgba(0, 0, 0, 0.22);
+
+  --overlay: rgba(0, 0, 0, 0.42);
+
+  --bg-blob-1: rgba(0, 0, 0, 0.055);
+  --bg-blob-2: rgba(0, 0, 0, 0.040);
+  --bg-blob-3: rgba(0, 0, 0, 0.030);
+  --bg-aurora-a: rgba(0, 0, 0, 0.045);
+  --bg-aurora-b: rgba(0, 0, 0, 0.030);
+  --bg-spot: rgba(255, 255, 255, 0.6);
+
+  /* Galaxy — silver dust over light grey. Held back so white surfaces and dark
+     text keep every bit of their contrast. */
+  --galaxy-arm: #4c4c4c;
+  --galaxy-bright: #7a7a7a;
+  --galaxy-core: #3a3a3a;
+  --galaxy-star: #303030;
+  --galaxy-opacity: 0.42;
+  --galaxy-period: 260s;
+  --bg-grid: rgba(0, 0, 0, 0.035);
+  --bg-veil: linear-gradient(180deg, rgba(247, 247, 247, 0.6) 0%, rgba(247, 247, 247, 0.85) 60%, var(--bg-0) 100%);
+
+  --img-veil: linear-gradient(180deg, rgba(0, 0, 0, 0) 40%, rgba(0, 0, 0, 0.72) 100%);
+  --bubble-mine: #1c1c20;
+  --bubble-mine-text: #ffffff;
+  --bubble-theirs: #efefef;
+
+  --scrollbar: rgba(0, 0, 0, 0.18);
+  --scrim: rgba(255, 255, 255, 0.55);
+}
+
+/* =============================================================
+   DARK — neutral black, no blue cast
+   ============================================================= */
+
+html[data-theme='dark'] {
+  color-scheme: dark;
+
+  --bg-0: #000000;
+  --bg-1: #050505;
+  --bg-elevated: #0d0d0d;
+
+  --surface: #101010;
+  --surface-2: #141414;
+  --surface-3: #1a1a1a;
+
+  --glass: rgba(255, 255, 255, 0.05);
+  --glass-strong: rgba(10, 10, 10, 0.88);
+  --glass-border: rgba(255, 255, 255, 0.09);
+
+  --border: rgba(255, 255, 255, 0.10);
+  --border-strong: rgba(255, 255, 255, 0.20);
+  --border-subtle: rgba(255, 255, 255, 0.055);
+
+  --text-0: #f5f5f5;
+  --text-1: #cccccc;
+  --text-2: #999999;
+  --text-3: #7d7d7d;
+  --text-inv: #0a0a0a;
+
+  --brand: #e8e8ea;
+  --brand-hover: #ffffff;
+  --brand-soft: rgba(255, 255, 255, 0.10);
+  --brand-ring: rgba(255, 255, 255, 0.30);
+  --brand-ink: #0b0b0d;
+
+  --ok: #dcdce0;
+  --ok-soft: rgba(255, 255, 255, 0.10);
+  --warn: #b4b4ba;
+  --warn-soft: rgba(255, 255, 255, 0.07);
+  --danger: #f08a84;
+  --danger-soft: rgba(240, 138, 132, 0.14);
+  --info: #a6a6ac;
+  --info-soft: rgba(255, 255, 255, 0.07);
+
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5), 0 6px 16px -8px rgba(0, 0, 0, 0.7);
+  --shadow-md: 0 2px 6px rgba(0, 0, 0, 0.45), 0 16px 32px -18px rgba(0, 0, 0, 0.8);
+  --shadow-lg: 0 4px 10px rgba(0, 0, 0, 0.5), 0 28px 64px -26px rgba(0, 0, 0, 0.9);
+
+  --overlay: rgba(0, 0, 0, 0.72);
+
+  --bg-blob-1: rgba(255, 255, 255, 0.050);
+  --bg-blob-2: rgba(255, 255, 255, 0.035);
+  --bg-blob-3: rgba(255, 255, 255, 0.025);
+  --bg-aurora-a: rgba(255, 255, 255, 0.050);
+  --bg-aurora-b: rgba(255, 255, 255, 0.030);
+  --bg-spot: rgba(255, 255, 255, 0.06);
+
+  /* The same artwork on black: silver light, dimmer overall so the black stays
+     genuinely black. */
+  --galaxy-arm: #b6b6b6;
+  --galaxy-bright: #ffffff;
+  --galaxy-core: #d6d6d6;
+  --galaxy-star: #ffffff;
+  --galaxy-opacity: 0.42;
+  --galaxy-period: 240s;
+  --bg-grid: rgba(255, 255, 255, 0.022);
+  --bg-veil: linear-gradient(180deg, rgba(0, 0, 0, 0.35) 0%, rgba(0, 0, 0, 0.7) 60%, var(--bg-0) 100%);
+
+  --img-veil: linear-gradient(180deg, rgba(0, 0, 0, 0) 38%, rgba(0, 0, 0, 0.88) 100%);
+  --bubble-mine: #e8e8ea;
+  --bubble-mine-text: #0b0b0d;
+  --bubble-theirs: rgba(255, 255, 255, 0.07);
+
+  --scrollbar: rgba(255, 255, 255, 0.16);
+  --scrim: rgba(0, 0, 0, 0.55);
+}

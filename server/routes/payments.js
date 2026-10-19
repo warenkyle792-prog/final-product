@@ -1,266 +1,355 @@
-const crypto = require('node:crypto');
+/**
+ * /api/payments — payment intents, status polling, sandbox simulation,
+ * my transactions, and provider webhooks.
+ *
+ * Card data and provider secrets never pass through these handlers: the
+ * client receives a client secret / STK prompt and the outcome always comes
+ * back from the provider (or the sandbox simulator) to the server.
+ */
 const express = require('express');
-const { requireAuth, requireRole } = require('../lib/auth');
-const { limiter } = require('../lib/rate-limits');
-const { nowIso, isId, isString, safeJson, validCurrency, notify, audit } = require('../lib/helpers');
 
-const PLACEMENTS = ['featured', 'boost', 'sponsored'];
-const PROVIDERS = ['mpesa', 'stripe'];
+const db = require('../db');
+const { requireAuth, optionalAuth } = require('../middleware/auth');
+const { getEventById, listTicketTypes, getSetting } = require('../db/helpers');
+const payments = require('../services/payments');
+const tickets = require('../services/tickets');
+const money = require('../services/payments/money');
 
-function timingSafeCompare(a, b) {
-  const left = Buffer.from(String(a));
-  const right = Buffer.from(String(b));
-  if (left.length !== right.length) return false;
-  return crypto.timingSafeEqual(left, right);
-}
+const router = express.Router();
 
-function sandboxLike(transaction) {
-  return safeJson(transaction.metadata).mode === 'sandbox' || String(transaction.provider_reference || '').startsWith('sandbox-');
-}
-function sandboxMessage(mode) {
-  return mode === 'sandbox'
-    ? 'Local sandbox mode: no provider is contacted and there is no charge.'
-    : 'Live checkout started. The ticket is issued once the provider confirms payment.';
-}
+/* ------------------------------------------------------------------ *
+ * Helpers
+ * ------------------------------------------------------------------ */
 
-const TICKET_SELECT = `SELECT t.*,e.title AS event_title,e.date AS event_date,e.time AS event_time,e.location AS event_location,e.venue AS event_venue,
-  tt.name AS ticket_name,u.name AS organizer_name,e.organizer_id AS organizer_id,att.name AS attendee_name
-  FROM tickets t JOIN events e ON e.id=t.event_id LEFT JOIN ticket_types tt ON tt.id=t.ticket_type_id JOIN users u ON u.id=e.organizer_id JOIN users att ON att.id=t.user_id`;
+/** Commission rate — owned by the payment service so pricing and reports agree. */
+const serviceFeePercent = payments.serviceFeePercent;
 
-function createPaymentRouter({ db, config, io, payments }) {
-  const router = express.Router();
-  const verifyLimit = limiter(config, 'verify', 'VERIFY_RATE_LIMITED');
+/**
+ * Build a validated cart from the client's selection.
+ * Prices and totals are always recomputed on the server.
+ */
+function buildCart({ eventId, items, userId }) {
+  const event = getEventById(eventId);
+  if (!event) throw Object.assign(new Error('Event not found'), { status: 404 });
+  if (event.status === 'cancelled') throw Object.assign(new Error('This event has been cancelled'), { status: 400 });
+  if (event.is_past) throw Object.assign(new Error('This event has already taken place'), { status: 400 });
 
-  router.get('/promotions/pricing', (_req, res) => {
-    const pricing = {};
-    for (const [currency, placements] of Object.entries(payments.promotionPrices)) {
-      pricing[currency] = Object.fromEntries(Object.entries(placements).map(([placement, amountMinor]) => [placement, { amount_minor: amountMinor, amount_major: amountMinor / 100 }]));
+  const requested = (Array.isArray(items) ? items : []).map((i) => ({
+    ticket_type_id: Number(i.ticket_type_id || i.id),
+    quantity: Math.max(0, Math.min(Number(i.quantity) || 0, 20)),
+  })).filter((i) => i.ticket_type_id && i.quantity > 0);
+
+  if (!requested.length) throw Object.assign(new Error('Select at least one ticket'), { status: 400 });
+
+  let fallback = null;
+  const tiers = listTicketTypes(event.id, { activeOnly: true });
+
+  const lines = requested.map((item) => {
+    let tier = tiers.find((t) => t.id === item.ticket_type_id);
+
+    if (!tier && tiers.length === 1) tier = tiers[0]; // single-tier convenience
+    if (!tier && !tiers.length) {
+      // Legacy event with no explicit tiers: treat the event price as one tier.
+      fallback = fallback || db.prepare(`
+        INSERT INTO ticket_types (event_id, name, description, price_cents, currency, quantity, sort_order)
+        VALUES (?, 'General admission', '', ?, ?, ?, 0)
+      `).run(event.id, event.base_price_cents || 0, event.currency || money.DEFAULT_CURRENCY, event.capacity || 0);
+      tier = listTicketTypes(event.id, { activeOnly: true })[0];
     }
-    res.json({ currencies: Object.keys(payments.promotionPrices), pricing });
+    if (!tier) throw Object.assign(new Error('That ticket type is no longer available'), { status: 400 });
+    if (!tier.is_active) throw Object.assign(new Error(`${tier.name} is not on sale`), { status: 400 });
+
+    const quantity = Math.min(item.quantity, tier.per_user_limit || 20);
+    return { tier, quantity };
   });
 
-  router.post('/payments', requireAuth, async (req, res) => {
-    const body = req.body || {};
-    const eventId = Number(body.event_id);
-    const provider = String(body.provider || '');
-    const currency = String(body.currency || '').toUpperCase();
-    const idempotencyKey = typeof body.idempotency_key === 'string' ? body.idempotency_key.trim() : '';
-    if (!isId(eventId) || !PROVIDERS.includes(provider) || !validCurrency(currency) || !isString(idempotencyKey, 8, 120)) {
-      return res.status(400).json({ error: 'INVALID_PAYMENT' });
-    }
-    try {
-      const outcome = await payments.createPayment({
-        userId: req.auth.user.id,
-        eventId,
-        ticketTypeId: body.ticket_type_id !== undefined ? Number(body.ticket_type_id) : undefined,
-        provider,
-        currency,
-        idempotencyKey,
-        purpose: 'ticket',
-        phone: typeof body.phone === 'string' ? body.phone : ''
-      });
-      const status = outcome.duplicate ? 200 : 201;
-      res.status(status).json({
-        payment: outcome.transaction,
-        duplicate: Boolean(outcome.duplicate),
-        mode: outcome.mode,
-        message: sandboxMessage(outcome.mode),
-        checkout_url: outcome.checkoutUrl || undefined,
-        publishable_key: outcome.publishableKey || undefined
-      });
-    } catch (error) {
-      const status = Number(error?.status) >= 400 ? Number(error.status) : 500;
-      res.status(status).json({ error: error?.code || 'INTERNAL_ERROR' });
-    }
-  });
-
-  router.post('/promotions', requireAuth, async (req, res) => {
-    const body = req.body || {};
-    const eventId = Number(body.event_id);
-    const placement = String(body.placement || '');
-    const provider = String(body.provider || '');
-    const currency = String(body.currency || '').toUpperCase();
-    const idempotencyKey = typeof body.idempotency_key === 'string' ? body.idempotency_key.trim() : '';
-    if (!isId(eventId) || !PLACEMENTS.includes(placement) || !PROVIDERS.includes(provider) || !validCurrency(currency) || !isString(idempotencyKey, 8, 120)) {
-      return res.status(400).json({ error: 'INVALID_INPUT' });
-    }
-    const event = db.get('SELECT id,organizer_id,title FROM events WHERE id=?', [eventId]);
-    if (!event) return res.status(404).json({ error: 'NOT_FOUND' });
-    if (event.organizer_id !== req.auth.user.id && req.auth.user.role !== 'admin') return res.status(403).json({ error: 'NOT_ALLOWED' });
-    try {
-      const outcome = await payments.createPayment({ userId: req.auth.user.id, eventId, provider, currency, idempotencyKey, purpose: 'promotion', placement });
-      const promotion = outcome.promotionId ? db.get('SELECT * FROM promotions WHERE id=?', [outcome.promotionId]) : null;
-      res.status(201).json({
-        promotion,
-        payment: outcome.transaction,
-        duplicate: Boolean(outcome.duplicate),
-        mode: outcome.mode,
-        message: sandboxMessage(outcome.mode),
-        checkout_url: outcome.checkoutUrl || undefined,
-        publishable_key: outcome.publishableKey || undefined
-      });
-    } catch (error) {
-      const status = Number(error?.status) >= 400 ? Number(error.status) : 500;
-      res.status(status).json({ error: error?.code || 'INTERNAL_ERROR' });
-    }
-  });
-
-  router.get('/payments', requireAuth, (req, res) => {
-    const rows = req.auth.user.role === 'admin'
-      ? db.all('SELECT * FROM transactions ORDER BY created_at DESC LIMIT 200')
-      : db.all('SELECT * FROM transactions WHERE user_id=? ORDER BY created_at DESC LIMIT 100', [req.auth.user.id]);
-    res.json({ payments: rows });
-  });
-
-  router.get('/payments/callback/mpesa', (req, res) => res.status(405).json({ error: 'METHOD_NOT_ALLOWED' }));
-  router.post('/payments/callback/mpesa', (req, res) => {
-    const expected = config.mpesa.callbackToken;
-    const supplied = req.get('x-mpesa-callback-token') || String(req.query.token || '');
-    if (!expected || !supplied || !timingSafeCompare(supplied, expected)) return res.status(401).json({ error: 'CALLBACK_UNAUTHORIZED' });
-    const transactionId = Number(req.query.ref);
-    const transaction = db.get('SELECT * FROM transactions WHERE id=?', [transactionId]);
-    if (!transaction || transaction.provider !== 'mpesa') return res.status(404).json({ error: 'NOT_FOUND' });
-    const callback = req.body?.Body?.stkCallback;
-    if (!callback || typeof callback !== 'object') return res.status(400).json({ error: 'INVALID_CALLBACK' });
-    if (callback.CheckoutRequestID && callback.CheckoutRequestID !== transaction.provider_reference) return res.status(400).json({ error: 'CALLBACK_MISMATCH' });
-    if (callback.ResultCode !== 0) {
-      payments.finalize(transaction.id, 'failed', 'mpesa-callback');
-      return res.json({ ok: true, status: 'failed' });
-    }
-    const items = Array.isArray(callback.CallbackMetadata?.Item) ? callback.CallbackMetadata.Item : [];
-    const amountItem = items.find((item) => item?.Name === 'Amount');
-    if (amountItem !== undefined && Math.round(Number(amountItem.Value) * 100) !== transaction.amount_minor) {
-      return res.status(400).json({ error: 'CALLBACK_AMOUNT_MISMATCH' });
-    }
-    payments.finalize(transaction.id, 'successful', 'mpesa-callback');
-    res.json({ ok: true, status: 'successful' });
-  });
-
-  router.post('/payments/callback/stripe', (req, res) => {
-    const secret = config.stripe.webhookSecret;
-    const header = String(req.get('stripe-signature') || '');
-    const rawBody = req.rawBody ? req.rawBody.toString('utf8') : JSON.stringify(req.body ?? {});
-    if (!secret || !header) return res.status(401).json({ error: 'CALLBACK_UNAUTHORIZED' });
-    const parts = header.split(',').map((piece) => piece.trim());
-    const timestamp = parts.find((piece) => piece.startsWith('t='))?.slice(2);
-    const signatures = parts.filter((piece) => piece.startsWith('v1=')).map((piece) => piece.slice(3));
-    if (!timestamp || !signatures.length || !/^\d+$/.test(timestamp) || Math.abs(Date.now() / 1000 - Number(timestamp)) > 600) {
-      return res.status(401).json({ error: 'CALLBACK_UNAUTHORIZED' });
-    }
-    const expected = crypto.createHmac('sha256', secret).update(`${timestamp}.${rawBody}`).digest();
-    const verified = signatures.some((signature) => {
-      const supplied = Buffer.from(signature, 'hex');
-      return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
-    });
-    if (!verified) return res.status(401).json({ error: 'CALLBACK_UNAUTHORIZED' });
-    const payload = req.body || {};
-    if (payload.type !== 'checkout.session.completed') return res.json({ ok: true, ignored: true });
-    const object = payload.data?.object || {};
-    const transactionId = Number(object.metadata?.transaction_id) || db.get('SELECT id FROM transactions WHERE provider_reference=?', [String(object.id || '')])?.id;
-    const transaction = db.get('SELECT * FROM transactions WHERE id=?', [transactionId]);
-    if (!transaction || transaction.provider !== 'stripe') return res.json({ ok: true, ignored: true });
-    if (transaction.status !== 'pending' && transaction.status !== 'processing') return res.json({ ok: true });
-    const amountMatches = Number(object.amount_total) === Number(transaction.amount_minor);
-    const currencyMatches = String(object.currency || '').toUpperCase() === String(transaction.currency).toUpperCase();
-    if (object.payment_status !== 'paid' || !amountMatches || !currencyMatches) {
-      return res.status(400).json({ error: 'CALLBACK_MISMATCH' });
-    }
-    payments.finalize(transaction.id, 'successful', 'stripe-webhook');
-    res.json({ ok: true, status: 'successful' });
-  });
-
-  function paymentGuard(req, res) {
-    const id = Number(req.params.id);
-    if (!isId(id)) return res.status(400).json({ error: 'INVALID_INPUT' });
-    const payment = db.get('SELECT * FROM transactions WHERE id=?', [id]);
-    if (!payment) return res.status(404).json({ error: 'NOT_FOUND' });
-    if (payment.user_id !== req.auth.user.id && req.auth.user.role !== 'admin') return res.status(403).json({ error: 'NOT_ALLOWED' });
-    return payment;
+  // Merge duplicates and respect per-user limits.
+  const merged = new Map();
+  for (const line of lines) {
+    const current = merged.get(line.tier.id);
+    if (current) current.quantity += line.quantity;
+    else merged.set(line.tier.id, { ...line });
   }
-  router.get('/payments/:id', requireAuth, (req, res) => {
-    const payment = paymentGuard(req, res);
-    if (payment?.id) res.json({ payment });
-  });
-  router.get('/payments/:id/status', requireAuth, async (req, res) => {
-    const payment = paymentGuard(req, res);
-    if (!payment?.id) return;
-    const synced = await payments.syncStatus(payment.id);
-    res.json({ payment: synced, sandbox: sandboxLike(synced) });
-  });
 
-  router.get('/promotions', requireAuth, (req, res) => {
-    const rows = req.auth.user.role === 'admin'
-      ? db.all('SELECT * FROM promotions ORDER BY created_at DESC LIMIT 200')
-      : db.all('SELECT * FROM promotions WHERE user_id=? ORDER BY created_at DESC LIMIT 100', [req.auth.user.id]);
-    res.json({ promotions: rows });
-  });
-
-  router.get('/tickets', requireAuth, (req, res) => {
-    const tickets = db.all(`${TICKET_SELECT} WHERE t.user_id=? ORDER BY e.date,e.time,t.created_at DESC`, [req.auth.user.id]);
-    res.json({ tickets });
-  });
-
-  function ticketGuard(req, res) {
-    const id = Number(req.params.id);
-    if (!isId(id)) return res.status(400).json({ error: 'INVALID_INPUT' });
-    const ticket = db.get(`${TICKET_SELECT} WHERE t.id=?`, [id]);
-    if (!ticket) return res.status(404).json({ error: 'NOT_FOUND' });
-    if (ticket.user_id !== req.auth.user.id && ticket.organizer_id !== req.auth.user.id && req.auth.user.role !== 'admin') {
-      return res.status(403).json({ error: 'NOT_ALLOWED' });
+  for (const line of merged.values()) {
+    const limit = line.tier.per_user_limit || 20;
+    if (line.quantity > limit) {
+      throw Object.assign(new Error(`You can buy up to ${limit} × ${line.tier.name} per order`), { status: 400 });
     }
-    return ticket;
-  }
-  router.get('/tickets/:id', requireAuth, (req, res) => {
-    const ticket = ticketGuard(req, res);
-    if (ticket?.id) res.json({ ticket });
-  });
-  router.get('/tickets/:id/qr', requireAuth, async (req, res) => {
-    const ticket = ticketGuard(req, res);
-    if (!ticket?.id) return;
-    const qr = await payments.qrData(ticket.id);
-    if (!qr) return res.status(404).json({ error: 'NOT_FOUND' });
-    res.json({ qr, payload: ticket.signed_payload });
-  });
+    if (line.tier.quantity > 0) {
+      // How many tickets for this tier the buyer already holds.
+      const held = db.prepare(`
+        SELECT COUNT(*) AS reserved FROM tickets
+        WHERE user_id = ? AND ticket_type_id = ? AND status IN ('valid','used')
+      `).get(userId, line.tier.id).reserved;
 
-  router.post('/verify', requireAuth, verifyLimit, (req, res) => {
-    if (!['organizer', 'admin'].includes(req.auth.user.role)) return res.status(403).json({ error: 'NOT_ALLOWED' });
-    const signedPayload = typeof req.body?.signed_payload === 'string' ? req.body.signed_payload.trim() : '';
-    if (!signedPayload) return res.status(400).json({ error: 'INVALID_TICKET_CODE', valid: false });
-    const result = payments.verifyTicket(signedPayload);
-    if (!result.valid) return res.status(400).json({ valid: false, error: 'INVALID_TICKET_CODE' });
-    const ticket = result.ticket;
-    if (req.auth.user.role !== 'admin') {
-      const event = db.get('SELECT organizer_id FROM events WHERE id=?', [ticket.event_id]);
-      if (!event || event.organizer_id !== req.auth.user.id) return res.status(403).json({ error: 'NOT_ALLOWED' });
-    }
-    let checkedIn = ticket.status === 'checked_in';
-    if (req.body?.check_in && ticket.status === 'valid') {
-      db.run('UPDATE tickets SET status=?, checked_in_at=? WHERE id=?', ['checked_in', nowIso(), ticket.id]);
-      checkedIn = true;
-    }
-    const fresh = db.get(`${TICKET_SELECT} WHERE t.id=?`, [ticket.id]);
-    res.json({ valid: true, ticket: fresh, checked_in: checkedIn });
-  });
-
-  router.post('/admin/payments/:id/refund', requireRole('admin'), (req, res) => {
-    const id = Number(req.params.id);
-    if (!isId(id)) return res.status(400).json({ error: 'INVALID_INPUT' });
-    const payment = db.get('SELECT * FROM transactions WHERE id=?', [id]);
-    if (!payment) return res.status(404).json({ error: 'NOT_FOUND' });
-    if (payment.status !== 'successful') return res.status(409).json({ error: 'NOT_REFUNDABLE' });
-    db.transaction(() => {
-      payments.finalize(payment.id, 'refunded', 'admin-refund');
-      const ticket = db.get('SELECT * FROM tickets WHERE transaction_id=?', [payment.id]);
-      if (ticket && ticket.status !== 'refunded') {
-        db.run("UPDATE tickets SET status='refunded' WHERE id=?", [ticket.id]);
-        if (ticket.ticket_type_id) db.run('UPDATE ticket_types SET sold = MAX(0, sold - 1) WHERE id=?', [ticket.ticket_type_id]);
+      if (userId && held + line.quantity > limit) {
+        throw Object.assign(new Error(`You already hold ${held} × ${line.tier.name} (limit ${limit})`), { status: 400 });
       }
-      audit(db, req.auth.user.id, 'payment.refund', 'transaction', payment.id, { amount_minor: payment.amount_minor, currency: payment.currency });
-    });
-    notify(db, io, payment.user_id, 'payment', 'Payment refunded', `Your payment for ${payment.amount_minor / 100} ${payment.currency} was refunded.`, 'transaction', payment.id);
-    res.json({ payment: db.get('SELECT * FROM transactions WHERE id=?', [id]) });
-  });
+      if (line.tier.remaining < line.quantity) {
+        throw Object.assign(
+          new Error(line.tier.remaining > 0
+            ? `Only ${line.tier.remaining} × ${line.tier.name} left`
+            : `${line.tier.name} is sold out`),
+          { status: 409 }
+        );
+      }
+    }
+  }
 
-  return router;
+  const currency = event.currency || money.DEFAULT_CURRENCY;
+  const linesOut = [...merged.values()].map(({ tier, quantity }) => ({
+    ticket_type_id: tier.id,
+    name: tier.name,
+    unit_price_cents: tier.price_cents,
+    quantity,
+    line_total_cents: tier.price_cents * quantity,
+  }));
+
+  const subtotal = linesOut.reduce((sum, l) => sum + l.line_total_cents, 0);
+  const feePercent = serviceFeePercent();
+  const fee = Math.round(subtotal * (feePercent / 100));
+  const total = subtotal + fee;
+
+  return {
+    event,
+    currency,
+    lines: linesOut,
+    subtotal_cents: subtotal,
+    service_fee_cents: fee,
+    service_fee_percent: feePercent,
+    total_cents: total,
+    is_free: total === 0,
+    used_fallback_tier: Boolean(fallback),
+  };
 }
-module.exports = { createPaymentRouter };
+
+/* ------------------------------------------------------------------ *
+ * Catalogue + quoting
+ * ------------------------------------------------------------------ */
+
+/** GET /api/payments/methods — what can be paid with, and in which mode. */
+router.get('/methods', (_req, res) => {
+  res.json({
+    methods: payments.methodAvailability(),
+    provider_modes: payments.providerModes(),
+    default_currency: money.DEFAULT_CURRENCY,
+    service_fee_percent: serviceFeePercent(),
+    sandbox: payments.methodAvailability().some((m) => m.mode === 'simulation'),
+  });
+});
+
+/** POST /api/payments/quote — server-side price for a selection. */
+router.post('/quote', optionalAuth, (req, res, next) => {
+  try {
+    const { event_id: eventId, items } = req.body || {};
+    const cart = buildCart({ eventId, items, userId: req.userId });
+    res.json({
+      quote: {
+        event_id: cart.event.id,
+        currency: cart.currency,
+        lines: cart.lines,
+        subtotal_cents: cart.subtotal_cents,
+        service_fee_cents: cart.service_fee_cents,
+        service_fee_percent: cart.service_fee_percent,
+        total_cents: cart.total_cents,
+        is_free: cart.is_free,
+        available: cart.event.available,
+        formatted: {
+          subtotal: money.format(cart.subtotal_cents, cart.currency),
+          fee: money.format(cart.service_fee_cents, cart.currency),
+          total: money.format(cart.total_cents, cart.currency),
+        },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * Intents
+ * ------------------------------------------------------------------ */
+
+/** POST /api/payments/intents — start a ticket purchase. */
+router.post('/intents', requireAuth, async (req, res, next) => {
+  try {
+    const {
+      event_id: eventId, items, method, phone = '', email = '',
+      attendees = [], idempotency_key: idempotencyKey = '',
+    } = req.body || {};
+
+    const cart = buildCart({ eventId, items, userId: req.userId });
+
+    if (cart.is_free) {
+      const result = payments.completeFreeRegistration({
+        userId: req.userId,
+        eventId: cart.event.id,
+        items: cart.lines.map((l) => ({ ticket_type_id: l.ticket_type_id, quantity: l.quantity })),
+        attendees,
+      });
+      const issued = db.prepare('SELECT id FROM tickets WHERE transaction_id = ?')
+        .all(result.transaction.id).map((row) => tickets.getById(row.id));
+
+      return res.status(201).json({
+        free: true,
+        transaction: result.transaction,
+        tickets: await Promise.all(issued.map((t) => tickets.present(t))),
+      });
+    }
+
+    const intent = await payments.createIntent({
+      userId: req.userId,
+      purpose: 'ticket',
+      amountCents: cart.total_cents,
+      currency: cart.currency,
+      method,
+      eventId: cart.event.id,
+      feeCents: cart.service_fee_cents,
+      payerPhone: phone,
+      payerEmail: email || req.user?.email,
+      metadata: {
+        items: cart.lines.map((l) => ({ ticket_type_id: l.ticket_type_id, quantity: l.quantity })),
+        attendees,
+        notes: `subtotal=${cart.subtotal_cents};fee=${cart.service_fee_cents}`,
+      },
+      idempotencyKey: idempotencyKey || `tickets-${req.userId}-${cart.event.id}`,
+    });
+
+    res.status(201).json({
+      transaction: intent.transaction,
+      instructions: intent.instructions,
+      provider_mode: intent.provider_mode,
+      quote: {
+        subtotal_cents: cart.subtotal_cents,
+        service_fee_cents: cart.service_fee_cents,
+        total_cents: cart.total_cents,
+        currency: cart.currency,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/** GET /api/payments — my transaction history. */
+router.get('/', requireAuth, (req, res) => {
+  res.json({
+    transactions: payments.ledgerForUser(req.userId, Number(req.query.limit) || 40),
+    currency: money.DEFAULT_CURRENCY,
+  });
+});
+
+/** GET /api/payments/:reference — poll status (server queries the provider). */
+router.get('/:reference', requireAuth, async (req, res, next) => {
+  try {
+    const transaction = await payments.syncStatus(req.params.reference, { userId: req.userId });
+
+    let issuedTickets = [];
+    if (transaction.status === 'successful' && transaction.purpose === 'ticket') {
+      issuedTickets = db.prepare('SELECT id FROM tickets WHERE transaction_id = ?')
+        .all(transaction.id)
+        .map((row) => tickets.getById(row.id))
+        .filter(Boolean);
+    }
+
+    const event = transaction.event_id ? getEventById(transaction.event_id) : null;
+
+    res.json({
+      transaction,
+      tickets: issuedTickets,
+      event: event ? { id: event.id, title: event.title, image_url: event.image_url, starts_at: event.starts_at } : null,
+      sandbox: transaction.metadata?.simulate === true,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/** POST /api/payments/:reference/simulate — sandbox only. */
+router.post('/:reference/simulate', requireAuth, async (req, res, next) => {
+  try {
+    const transaction = await payments.simulate(req.params.reference, {
+      outcome: String(req.body?.outcome || 'successful'),
+      userId: req.userId,
+    });
+
+    let issuedTickets = [];
+    if (transaction.status === 'successful' && transaction.purpose === 'ticket') {
+      issuedTickets = db.prepare('SELECT id FROM tickets WHERE transaction_id = ?')
+        .all(transaction.id)
+        .map((row) => tickets.getById(row.id))
+        .filter(Boolean);
+    }
+    res.json({ transaction, tickets: issuedTickets, sandbox: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/** POST /api/payments/:reference/cancel — user abandons a pending intent. */
+router.post('/:reference/cancel', requireAuth, (req, res, next) => {
+  try {
+    const txn = payments.findByReference(req.params.reference);
+    if (!txn || (txn.user_id !== req.userId && req.user.role !== 'admin')) {
+      return res.status(404).json({ error: 'Transaction not found' });
+    }
+    if (!['pending', 'processing'].includes(txn.status)) {
+      return res.status(400).json({ error: 'Only pending payments can be cancelled' });
+    }
+    payments.applyProviderResult(txn, { status: 'cancelled', failure_reason: 'Cancelled by customer' }, { source: 'user' });
+    if (txn.promotion_id) {
+      db.prepare("UPDATE promotions SET status = 'cancelled' WHERE id = ? AND status = 'pending'").run(txn.promotion_id);
+    }
+    res.json({ transaction: payments.publicTransaction(payments.findByReference(req.params.reference)) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * Webhooks (public — authenticity is enforced inside the providers)
+ * ------------------------------------------------------------------ */
+
+/** POST /api/payments/webhooks/mpesa — Daraja STK callback. */
+router.post('/webhooks/mpesa', async (req, res) => {
+  try {
+    const mpesa = payments.providers.find((p) => p.id === 'mpesa');
+    if (!mpesa.callbackAllowed(req)) {
+      return res.status(403).json({ ResultCode: 1, ResultDesc: 'Rejected' });
+    }
+    const result = await payments.handleProviderCallback('mpesa', req.body, { source: 'mpesa_callback' });
+    // Daraja expects a 200 with an acknowledgement body.
+    res.json({ ResultCode: 0, ResultDesc: result.ok ? 'Accepted' : 'Ignored' });
+  } catch (error) {
+    console.error('[payments] mpesa callback error:', error.message);
+    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+  }
+});
+
+/** POST /api/payments/webhooks/card — Stripe-compatible webhook (signed). */
+router.post('/webhooks/card', (req, res) => {
+  try {
+    const card = payments.providers.find((p) => p.id === 'card');
+    const rawBody = req.rawBody || JSON.stringify(req.body || {});
+
+    if (card.isConfigured()) {
+      const check = card.verifySignature(rawBody, req.get('stripe-signature'));
+      if (!check.ok) {
+        return res.status(400).json({ error: `Webhook rejected: ${check.error}` });
+      }
+    }
+
+    payments.handleProviderCallback('card', req.body, { source: 'card_webhook' })
+      .then(() => res.json({ received: true }))
+      .catch((error) => {
+        console.error('[payments] card webhook error:', error.message);
+        res.json({ received: true });
+      });
+  } catch (error) {
+    console.error('[payments] card webhook error:', error.message);
+    res.status(200).json({ received: true });
+  }
+});
+
+module.exports = router;
