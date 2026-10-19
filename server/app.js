@@ -76,6 +76,8 @@ async function createApplication(options = {}) {
       }
     },
     crossOriginEmbedderPolicy: false,
+    // Framing is governed by the CSP frame-ancestors directive above.
+    xFrameOptions: false,
     hsts: config.mode === 'production' ? { maxAge: 31536000, includeSubDomains: true, preload: true } : false
   }));
   app.use(compression());
