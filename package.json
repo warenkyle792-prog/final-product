@@ -13,7 +13,7 @@
     "dev": "concurrently -k -n api,client -c white,gray \"npm:dev:server\" \"npm:dev:client\"",
     "dev:server": "node --watch server/index.js",
     "dev:client": "npm run dev --workspace client -- --host 0.0.0.0",
-    "build": "npm run build --workspace client",
+    "build": "node scripts/assemble-dist.js",
     "build:dist": "node scripts/assemble-dist.js",
     "start": "node scripts/assemble-dist.js && node server/index.js",
     "seed": "node server/scripts/seed.js",

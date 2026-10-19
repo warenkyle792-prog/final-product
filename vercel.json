@@ -1,0 +1,13 @@
+{
+  "functions": {
+    "api/index.js": {
+      "includeFiles": "{client/dist/**,data/**}"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/api/index.js"
+    }
+  ]
+}
